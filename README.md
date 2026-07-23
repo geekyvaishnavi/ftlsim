@@ -76,13 +76,59 @@ cmake --build build
 ./build/ftlsim --workload random --pages 10000 --blocks 128 --gc-policy greedy
 ```
 
+No CMake? A plain `Makefile` builds the same two binaries into `build/`:
+
+```bash
+make          # build/ftlsim and build/ftlsim_tests
+make test     # run the test suite
+```
+
+### Tests
+
+```bash
+cd build && ctest        # or: make test
+```
+
+The suite is self-contained (no external framework) and covers the NAND state
+machine, mapping consistency after GC, write-amplification accounting, both GC
+policies, both wear-leveling modes, and the workload generators.
+
+### Options
+
+Run `ftlsim --help` for the full list. The ones that matter most:
+
+| Flag | Meaning |
+|---|---|
+| `--workload` | `sequential` \| `random` \| `hotspot` |
+| `--pages N` | number of host requests to issue |
+| `--blocks N`, `--pages-per-block N` | device geometry |
+| `--overprovisioning F` | spare capacity hidden from the host (default 0.10) |
+| `--gc-policy` | `greedy` \| `cost-benefit` |
+| `--wear-leveling` | `none` \| `dynamic` \| `static` |
+| `--prefill` | fill the device before measuring, so cold data exists |
+| `--trace FILE` | replay a workload trace instead of generating one |
+| `--dump FILE` | write the JSONL visualization trace |
+| `--histogram` | print the erase-count distribution |
+
 ## Sample Output
 
 ```
+$ ./build/ftlsim --workload random --pages 10000 --blocks 128 --gc-policy greedy
+
+Device: 128 blocks x 64 pages (7372 logical pages, 10% OP)
+Policy: gc=greedy wear-leveling=dynamic
+Workload: random
+
 Total writes: 10000
-Total erases: 42
-Write Amplification Factor: 1.34
-Max erase count: 12 | Min erase count: 9 (wear leveled)
+Total erases: 48
+Write Amplification Factor: 1.11
+Max erase count: 1 | Min erase count: 0 (wear leveled)
+
+Breakdown
+  Physical writes:   11054 (host 10000 + gc 1054 + wear leveling 0)
+  GC runs:           48
+  WL migrations:     0
+  Erase spread:      1 (mean 0.38, stddev 0.48)
 ```
 
 ## Visualization
@@ -104,13 +150,30 @@ Because the frontend consumes a recorded trace, it runs independently of the sim
 
 ## Evaluation
 
-Experiments are run across sequential, random, and hotspot workloads for each GC policy, comparing:
+`./scripts/experiments.sh` runs the full matrix — every workload × GC policy ×
+wear-leveling mode — and prints it as a markdown table. `PREFILL=1` starts each
+run from a full device, which is the condition where static wear leveling has
+cold data to migrate.
 
-- Write amplification factor (WAF)
-- Erase count distribution across blocks (wear-leveling effectiveness)
-- GC trigger frequency
+Headline results (200,000 host writes, 128 × 64 pages, 10% OP):
 
-Full results and analysis are documented in the project report (see `/docs`).
+| Workload | Greedy WAF | Cost-benefit WAF |
+|---|---|---|
+| Sequential | 1.00 | 1.00 |
+| Hotspot | 2.84 | 2.89 |
+| Random | 5.48 | 6.00 |
+
+Three findings, in descending order of effect size:
+
+1. **The workload sets write amplification, not the policy.** The spread across
+   workloads (1.00 → 5.48) dwarfs the spread across GC policies (≤ 0.5).
+2. **Over-provisioning dominates every policy choice.** Raising spare capacity
+   from 5% to 20% cuts random-write amplification from 12.75 to 2.71.
+3. **Cost-benefit loses to greedy here** — the opposite of the usual published
+   result, because this FTL has a single write frontier and so never realizes
+   the hot/cold separation the policy depends on. See the report.
+
+Full tables, method, and threats to validity: [docs/REPORT.md](docs/REPORT.md).
 
 ## Project Structure
 
@@ -148,12 +211,18 @@ ftlsim/
 │       └── workload/
 │           ├── generator.hpp
 │           └── trace.hpp
-├── web/                    # visualization dashboard
-├── docs/                   # project report, diagrams
+├── web/
+│   └── index.html          # visualization dashboard (self-contained)
+├── docs/
+│   └── REPORT.md           # results and analysis
+├── scripts/
+│   └── experiments.sh      # evaluation matrix runner
 ├── testdata/
-│   └── workloads/
+│   └── workloads/          # sample input traces
 ├── tests/
+│   └── test_ftlsim.cpp
 ├── CMakeLists.txt
+├── Makefile                # fallback build, no CMake needed
 ├── README.md
 ├── LICENSE
 └── .gitignore
@@ -171,6 +240,11 @@ ftlsim/
 - Single-threaded, no concurrency modeling
 - Synthetic/trace-based workloads only, no real block-device interface
 - No power-loss/crash-consistency simulation
+- Counts page programs and erases, not time — no latency or IOPS modeling
+- **Single write frontier**: GC copy-outs and host writes share one open block,
+  so there is no hot/cold data separation. This is what holds the cost-benefit
+  policy back (see [docs/REPORT.md](docs/REPORT.md)) and is the most valuable
+  next extension
 
 ## Related Work
 

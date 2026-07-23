@@ -1,0 +1,743 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ftlsim — NAND state replay</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-1: #fcfcfb;
+    --plane: #f9f9f7;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --border: rgba(11, 11, 11, 0.10);
+    /* State encoding: valid = categorical slot 1, invalid = slot 2,
+       free = recessive neutral (it is "absence", not a third category). */
+    --state-valid: #2a78d6;
+    --state-invalid: #eb6834;
+    --state-free: #e1e0d9;
+    --accent-gc: #fab219;      /* status: warning -- GC victim this step */
+    --accent-wl: #0ca30c;      /* status: good -- wear-leveling migration */
+    --open-block: #4a3aa7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface-1: #1a1a19;
+      --plane: #0d0d0d;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted: #898781;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --border: rgba(255, 255, 255, 0.10);
+      --state-valid: #3987e5;
+      --state-invalid: #d95926;
+      --state-free: #2c2c2a;
+      --accent-gc: #fab219;
+      --accent-wl: #0ca30c;
+      --open-block: #9085e9;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-1: #1a1a19;
+    --plane: #0d0d0d;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --state-valid: #3987e5;
+    --state-invalid: #d95926;
+    --state-free: #2c2c2a;
+    --accent-gc: #fab219;
+    --accent-wl: #0ca30c;
+    --open-block: #9085e9;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: var(--plane);
+    color: var(--text-primary);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header { max-width: 1400px; margin: 0 auto 20px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--text-secondary); margin: 0; }
+  main { max-width: 1400px; margin: 0 auto; display: grid; gap: 16px; }
+
+  .card {
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .card h2 {
+    font-size: 12px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--text-muted);
+    margin: 0 0 12px;
+  }
+
+  /* --- controls ------------------------------------------------------ */
+  .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  button {
+    font: inherit; font-weight: 500;
+    background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--axis); border-radius: 7px;
+    padding: 7px 14px; cursor: pointer; min-height: 36px;
+  }
+  button:hover:not(:disabled) { background: var(--plane); }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button.primary { background: var(--state-valid); border-color: var(--state-valid); color: #fff; }
+  input[type=range] { flex: 1 1 240px; min-width: 160px; accent-color: var(--state-valid); height: 36px; }
+  label.file {
+    display: inline-flex; align-items: center; gap: 8px;
+    border: 1px dashed var(--axis); border-radius: 7px;
+    padding: 7px 14px; cursor: pointer; min-height: 36px;
+  }
+  label.file input { display: none; }
+  select { font: inherit; padding: 7px 10px; border-radius: 7px;
+           border: 1px solid var(--axis); background: var(--surface-1); color: var(--text-primary); min-height: 36px; }
+  .step-readout { font-variant-numeric: tabular-nums; color: var(--text-secondary); white-space: nowrap; }
+
+  /* --- stat tiles ---------------------------------------------------- */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+  .tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .tile .k { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
+  .tile .v { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; margin-top: 2px; }
+  .tile.hero .v { font-size: 38px; }
+  .tile .note { font-size: 12px; color: var(--text-secondary); }
+
+  /* --- layout -------------------------------------------------------- */
+  .split { display: grid; grid-template-columns: minmax(0, 2.2fr) minmax(260px, 1fr); gap: 16px; align-items: start; }
+  @media (max-width: 900px) { .split { grid-template-columns: minmax(0, 1fr); } }
+
+  .canvas-wrap { position: relative; width: 100%; overflow-x: auto; }
+  canvas { display: block; width: 100%; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 12px; font-size: 12px; color: var(--text-secondary); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 11px; height: 11px; border-radius: 3px; border: 1px solid var(--axis); }
+  .ramp { width: 76px; height: 11px; border-radius: 3px; border: 1px solid var(--axis); }
+
+  /* --- event log ----------------------------------------------------- */
+  .events { max-height: 260px; overflow-y: auto; font-size: 13px; }
+  .events ol { list-style: none; margin: 0; padding: 0; }
+  .events li { display: flex; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--grid); }
+  .events li:last-child { border-bottom: 0; }
+  .events .dot { width: 8px; height: 8px; border-radius: 50%; margin-top: 6px; flex: none; }
+  .events .when { color: var(--text-muted); font-variant-numeric: tabular-nums; flex: none; }
+  .empty { color: var(--text-muted); font-style: italic; }
+
+  /* --- tooltip ------------------------------------------------------- */
+  #tip {
+    position: fixed; pointer-events: none; opacity: 0; transition: opacity 0.08s;
+    background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--axis); border-radius: 8px;
+    padding: 8px 10px; font-size: 12px; line-height: 1.45;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18); z-index: 10; max-width: 240px;
+  }
+  #tip b { font-weight: 600; }
+  #tip .r { display: flex; justify-content: space-between; gap: 14px; color: var(--text-secondary); }
+  #tip .r b { color: var(--text-primary); font-variant-numeric: tabular-nums; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--grid); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--text-muted); font-weight: 500; }
+  details summary { cursor: pointer; color: var(--text-secondary); font-size: 13px; }
+  .hint code { background: var(--plane); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ftlsim — NAND state replay</h1>
+  <p class="sub">Load a JSONL trace produced by
+    <code>ftlsim --dump trace.jsonl</code> and scrub through the run.</p>
+</header>
+
+<main>
+  <section class="card">
+    <div class="controls">
+      <label class="file">
+        <input type="file" id="file" accept=".jsonl,.json,.txt">
+        <span id="file-label">Load trace.jsonl…</span>
+      </label>
+      <button id="play" class="primary" disabled>Play</button>
+      <button id="prev" disabled>‹ Step</button>
+      <button id="next" disabled>Step ›</button>
+      <input type="range" id="scrub" min="0" max="0" value="0" disabled aria-label="Timeline position">
+      <span class="step-readout" id="readout">no trace loaded</span>
+      <select id="mode" disabled aria-label="Block coloring">
+        <option value="state">Color: page state</option>
+        <option value="erase">Color: erase count</option>
+      </select>
+      <select id="speed" aria-label="Playback speed">
+        <option value="240">0.5x</option>
+        <option value="120" selected>1x</option>
+        <option value="50">2x</option>
+        <option value="16">8x</option>
+      </select>
+    </div>
+    <p class="sub hint" id="run-info" style="margin-top:12px"></p>
+  </section>
+
+  <section class="tiles" id="tiles"></section>
+
+  <div class="split">
+    <section class="card">
+      <h2>NAND array</h2>
+      <div class="canvas-wrap">
+        <canvas id="grid" role="img" aria-label="NAND block and page state grid"></canvas>
+      </div>
+      <div class="legend" id="legend"></div>
+    </section>
+
+    <div style="display:grid; gap:16px">
+      <section class="card">
+        <h2>Write amplification over time</h2>
+        <div class="canvas-wrap">
+          <canvas id="waf" role="img" aria-label="Write amplification factor over time"></canvas>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Erase-count distribution</h2>
+        <div class="canvas-wrap">
+          <canvas id="hist" role="img" aria-label="Histogram of block erase counts"></canvas>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Events at this step</h2>
+        <div class="events" id="events"><p class="empty">No trace loaded.</p></div>
+      </section>
+    </div>
+  </div>
+
+  <section class="card">
+    <details>
+      <summary>Metrics as a table</summary>
+      <div id="table" style="margin-top:12px"></div>
+    </details>
+  </section>
+</main>
+
+<div id="tip" role="tooltip"></div>
+
+<script>
+(() => {
+  "use strict";
+
+  const $ = (id) => document.getElementById(id);
+  const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+  // Sequential blue ramp (one hue, light -> dark). On a dark surface the order
+  // flips so the step nearest the surface still means "near zero".
+  const RAMP = ["#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec", "#5598e7",
+                "#3987e5", "#2a78d6", "#256abf", "#1c5cab", "#184f95", "#104281", "#0d366b"];
+  const isDark = () => {
+    const t = document.documentElement.getAttribute("data-theme");
+    if (t) return t === "dark";
+    return matchMedia("(prefers-color-scheme: dark)").matches;
+  };
+  const rampColor = (t) => {
+    const ramp = isDark() ? [...RAMP].reverse() : RAMP;
+    const clamped = Math.max(0, Math.min(1, t));
+    return ramp[Math.round(clamped * (ramp.length - 1))];
+  };
+
+  const state = {
+    config: null,
+    snapshots: [],
+    summary: null,
+    index: 0,
+    playing: false,
+    timer: null,
+    layout: null,
+    hover: -1,
+  };
+
+  const fmt = (n) => (n == null ? "—" : n.toLocaleString());
+  const fmt2 = (n) => (n == null ? "—" : Number(n).toFixed(2));
+
+  // --- parsing -------------------------------------------------------------
+
+  function parseTrace(text) {
+    const config = { blocks: 0, pages_per_block: 0 };
+    const snapshots = [];
+    let summary = null;
+    let parsed = null;
+
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let record;
+      try { record = JSON.parse(trimmed); } catch { continue; }
+      if (record.type === "config") parsed = record;
+      else if (record.type === "snapshot") snapshots.push(record);
+      else if (record.type === "summary") summary = record;
+    }
+    if (!snapshots.length) throw new Error("no snapshots found in this file");
+
+    const first = snapshots[0];
+    const merged = parsed || config;
+    merged.blocks = merged.blocks || first.blocks.length;
+    merged.pages_per_block = merged.pages_per_block || first.blocks[0].p.length;
+    return { config: merged, snapshots, summary };
+  }
+
+  // --- NAND grid -----------------------------------------------------------
+
+  function computeLayout(width) {
+    const blocks = state.config.blocks;
+    const ppb = state.config.pages_per_block;
+    const pageCols = Math.ceil(Math.sqrt(ppb));
+    const pageRows = Math.ceil(ppb / pageCols);
+
+    // Choose a block-column count that keeps the array roughly 2:1.
+    let blockCols = Math.ceil(Math.sqrt(blocks * 2));
+    blockCols = Math.min(blockCols, blocks);
+    const blockRows = Math.ceil(blocks / blockCols);
+
+    const gapBlock = 6;
+    const available = Math.max(320, width) - gapBlock * (blockCols - 1);
+    // 2px surface gap between page cells, per the mark spec.
+    const cell = Math.max(2, Math.floor(available / blockCols / pageCols));
+    const pagePitch = cell + 1;
+    const blockW = pageCols * pagePitch;
+    const blockH = pageRows * pagePitch;
+
+    return {
+      blocks, ppb, pageCols, pageRows, blockCols, blockRows,
+      gapBlock, cell, pagePitch, blockW, blockH,
+      width: blockCols * blockW + gapBlock * (blockCols - 1),
+      height: blockRows * blockH + gapBlock * (blockRows - 1),
+    };
+  }
+
+  function blockOrigin(layout, index) {
+    const col = index % layout.blockCols;
+    const row = Math.floor(index / layout.blockCols);
+    return {
+      x: col * (layout.blockW + layout.gapBlock),
+      y: row * (layout.blockH + layout.gapBlock),
+    };
+  }
+
+  function setupCanvas(canvas, cssWidth, cssHeight) {
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(cssWidth * dpr);
+    canvas.height = Math.round(cssHeight * dpr);
+    canvas.style.height = cssHeight + "px";
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssWidth, cssHeight);
+    return ctx;
+  }
+
+  function drawGrid() {
+    const canvas = $("grid");
+    if (!state.config) return;
+    const wrapWidth = canvas.parentElement.clientWidth || 640;
+    const layout = computeLayout(wrapWidth);
+    state.layout = layout;
+
+    const ctx = setupCanvas(canvas, layout.width, layout.height);
+    const snap = state.snapshots[state.index];
+    const mode = $("mode").value;
+
+    const colors = {
+      f: css("--state-free"),
+      v: css("--state-valid"),
+      i: css("--state-invalid"),
+    };
+    // Normalize across the observed range, not against zero: once every block
+    // has been erased 7-12 times, scaling from 0 would crush them all into the
+    // dark end of the ramp and hide exactly the differences worth seeing.
+    const eraseCounts = snap.blocks.map((b) => b.e);
+    const minErase = Math.min(...eraseCounts);
+    const maxErase = Math.max(...eraseCounts);
+    const eraseSpan = Math.max(1, maxErase - minErase);
+    const gcBlocks = new Set(snap.gc.map((e) => e.block));
+    const wlBlocks = new Set(snap.wl.map((e) => e.block));
+
+    snap.blocks.forEach((block, index) => {
+      const { x, y } = blockOrigin(layout, index);
+
+      if (mode === "erase") {
+        // One flat block-level color: the magnitude is per block, not per page.
+        ctx.fillStyle = rampColor((block.e - minErase) / eraseSpan);
+        ctx.beginPath();
+        ctx.roundRect(x, y, layout.blockW - 1, layout.blockH - 1, 3);
+        ctx.fill();
+      } else {
+        for (let p = 0; p < block.p.length; p++) {
+          const col = p % layout.pageCols;
+          const row = Math.floor(p / layout.pageCols);
+          ctx.fillStyle = colors[block.p[p]] || colors.f;
+          ctx.fillRect(x + col * layout.pagePitch, y + row * layout.pagePitch,
+                       layout.cell, layout.cell);
+        }
+      }
+
+      // 2px surface ring marks blocks touched this step, so the eye lands on
+      // the GC/wear-leveling activity without recoloring the state encoding.
+      let ring = null;
+      if (gcBlocks.has(index)) ring = css("--accent-gc");
+      else if (wlBlocks.has(index)) ring = css("--accent-wl");
+      else if (index === snap.open_block) ring = css("--open-block");
+      if (ring || state.hover === index) {
+        ctx.strokeStyle = state.hover === index ? css("--text-primary") : ring;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.roundRect(x - 1.5, y - 1.5, layout.blockW + 1, layout.blockH + 1, 4);
+        ctx.stroke();
+      }
+    });
+  }
+
+  function blockAt(clientX, clientY) {
+    const layout = state.layout;
+    if (!layout) return -1;
+    const rect = $("grid").getBoundingClientRect();
+    const scale = rect.width / layout.width;
+    const x = (clientX - rect.left) / scale;
+    const y = (clientY - rect.top) / scale;
+    const col = Math.floor(x / (layout.blockW + layout.gapBlock));
+    const row = Math.floor(y / (layout.blockH + layout.gapBlock));
+    if (col < 0 || col >= layout.blockCols || row < 0) return -1;
+    const index = row * layout.blockCols + col;
+    return index >= 0 && index < layout.blocks ? index : -1;
+  }
+
+  // --- line + bar charts ---------------------------------------------------
+
+  function drawWaf() {
+    const canvas = $("waf");
+    const width = canvas.parentElement.clientWidth || 320;
+    const height = 150;
+    const ctx = setupCanvas(canvas, width, height);
+    if (!state.snapshots.length) return;
+
+    const pad = { l: 38, r: 10, t: 10, b: 22 };
+    const points = state.snapshots.map((s) => s.metrics.waf);
+    const maxWaf = Math.max(1.2, ...points);
+    const lastT = state.snapshots[state.snapshots.length - 1].t || 1;
+
+    const px = (i) => pad.l + (state.snapshots[i].t / lastT) * (width - pad.l - pad.r);
+    const py = (v) => height - pad.b - ((v - 1) / (maxWaf - 1)) * (height - pad.t - pad.b);
+
+    // Recessive gridlines + axis labels.
+    ctx.strokeStyle = css("--grid");
+    ctx.lineWidth = 1;
+    ctx.fillStyle = css("--text-muted");
+    ctx.font = "11px system-ui, sans-serif";
+    ctx.textAlign = "right";
+    for (let g = 0; g <= 3; g++) {
+      const value = 1 + (maxWaf - 1) * (g / 3);
+      const y = Math.round(py(value)) + 0.5;
+      ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(width - pad.r, y); ctx.stroke();
+      ctx.fillText(value.toFixed(2), pad.l - 6, y + 4);
+    }
+
+    ctx.strokeStyle = css("--state-valid");
+    ctx.lineWidth = 2;
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    points.forEach((v, i) => (i ? ctx.lineTo(px(i), py(v)) : ctx.moveTo(px(i), py(v))));
+    ctx.stroke();
+
+    // Current position marker, ringed in the surface color so it reads on top.
+    const i = state.index;
+    ctx.beginPath();
+    ctx.arc(px(i), py(points[i]), 4.5, 0, Math.PI * 2);
+    ctx.fillStyle = css("--state-valid");
+    ctx.fill();
+    ctx.strokeStyle = css("--surface-1");
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    ctx.fillStyle = css("--text-secondary");
+    ctx.textAlign = "left";
+    ctx.fillText("WAF " + fmt2(points[i]), pad.l + 4, pad.t + 10);
+    ctx.textAlign = "right";
+    ctx.fillStyle = css("--text-muted");
+    ctx.fillText(fmt(state.snapshots[i].t) + " writes", width - pad.r, height - 6);
+  }
+
+  function drawHistogram() {
+    const canvas = $("hist");
+    const width = canvas.parentElement.clientWidth || 320;
+    const height = 150;
+    const ctx = setupCanvas(canvas, width, height);
+    if (!state.snapshots.length) return;
+
+    const snap = state.snapshots[state.index];
+    const counts = snap.blocks.map((b) => b.e);
+    const min = Math.min(...counts);
+    const max = Math.max(...counts);
+    const span = Math.max(1, max - min + 1);
+    // Early in a run the spread is only a few erases; one bucket per distinct
+    // count reads better than ten buckets with six of them empty.
+    const buckets = Math.min(10, span);
+    const bins = new Array(buckets).fill(0);
+    counts.forEach((c) => {
+      const bin = Math.min(buckets - 1, Math.floor(((c - min) / span) * buckets));
+      bins[bin]++;
+    });
+
+    const pad = { l: 28, r: 10, t: 10, b: 22 };
+    const peak = Math.max(1, ...bins);
+    const plotW = width - pad.l - pad.r;
+    const plotH = height - pad.t - pad.b;
+    // 2px gap between adjacent bars, per the mark spec.
+    const barW = Math.max(3, plotW / buckets - 2);
+
+    ctx.fillStyle = css("--state-valid");
+    bins.forEach((count, b) => {
+      if (!count) return;
+      const h = (count / peak) * plotH;
+      const x = pad.l + b * (plotW / buckets);
+      const y = pad.t + plotH - h;
+      ctx.beginPath();
+      // Rounded data-end, square against the baseline.
+      ctx.roundRect(x, y, barW, h, [4, 4, 0, 0]);
+      ctx.fill();
+    });
+
+    ctx.strokeStyle = css("--axis");
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(pad.l, pad.t + plotH + 0.5);
+    ctx.lineTo(width - pad.r, pad.t + plotH + 0.5);
+    ctx.stroke();
+
+    ctx.fillStyle = css("--text-muted");
+    ctx.font = "11px system-ui, sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText(String(min), pad.l, height - 6);
+    ctx.textAlign = "right";
+    ctx.fillText(String(max) + " erases", width - pad.r, height - 6);
+    ctx.textAlign = "left";
+    ctx.fillStyle = css("--text-secondary");
+    ctx.fillText("spread " + (max - min), pad.l, pad.t + 10);
+  }
+
+  // --- panels --------------------------------------------------------------
+
+  function renderTiles() {
+    const snap = state.snapshots[state.index];
+    const m = snap.metrics;
+    const tiles = [
+      { k: "Write amplification", v: fmt2(m.waf), note: "physical ÷ host writes", hero: true },
+      { k: "Host writes", v: fmt(m.host_writes) },
+      { k: "Relocated pages", v: fmt(m.gc_writes + m.wl_writes), note: "gc " + fmt(m.gc_writes) + " · wl " + fmt(m.wl_writes) },
+      { k: "Erases", v: fmt(m.erases), note: fmt(m.gc_runs) + " GC runs" },
+      { k: "Erase spread", v: fmt(m.erase_max - m.erase_min), note: "min " + fmt(m.erase_min) + " · max " + fmt(m.erase_max) },
+      { k: "Erase σ", v: fmt2(m.erase_stddev), note: "lower is better leveled" },
+    ];
+    $("tiles").innerHTML = tiles.map((t) => `
+      <div class="tile${t.hero ? " hero" : ""}">
+        <div class="k">${t.k}</div>
+        <div class="v">${t.v}</div>
+        ${t.note ? `<div class="note">${t.note}</div>` : ""}
+      </div>`).join("");
+  }
+
+  function renderLegend() {
+    const mode = $("mode").value;
+    const box = $("legend");
+    if (mode === "erase") {
+      const stops = (isDark() ? [...RAMP].reverse() : RAMP).join(",");
+      box.innerHTML = `
+        <span><span class="ramp" style="background:linear-gradient(90deg, ${stops})"></span> fewer → more erases</span>
+        <span><span class="swatch" style="background:transparent;border:2px solid var(--accent-gc)"></span> GC this step</span>
+        <span><span class="swatch" style="background:transparent;border:2px solid var(--accent-wl)"></span> wear-level migration</span>
+        <span><span class="swatch" style="background:transparent;border:2px solid var(--open-block)"></span> open block</span>`;
+    } else {
+      box.innerHTML = `
+        <span><span class="swatch" style="background:var(--state-valid)"></span> valid</span>
+        <span><span class="swatch" style="background:var(--state-invalid)"></span> invalid</span>
+        <span><span class="swatch" style="background:var(--state-free)"></span> free</span>
+        <span><span class="swatch" style="background:transparent;border:2px solid var(--accent-gc)"></span> GC this step</span>
+        <span><span class="swatch" style="background:transparent;border:2px solid var(--accent-wl)"></span> wear-level migration</span>
+        <span><span class="swatch" style="background:transparent;border:2px solid var(--open-block)"></span> open block</span>`;
+    }
+  }
+
+  function renderEvents() {
+    const snap = state.snapshots[state.index];
+    const rows = [];
+    for (const e of snap.gc) {
+      rows.push({ t: e.t, color: "var(--accent-gc)",
+        text: `GC reclaimed block ${e.block} — copied ${e.copied} valid, freed ${e.reclaimed} invalid (erase #${e.erase_count})` });
+    }
+    for (const e of snap.wl) {
+      rows.push({ t: e.t, color: "var(--accent-wl)",
+        text: `Wear leveling migrated block ${e.block} — ${e.copied} pages moved (erases ${e.erase_count} vs max ${e.max_erase_count})` });
+    }
+    rows.sort((a, b) => a.t - b.t);
+
+    $("events").innerHTML = rows.length
+      ? `<ol>${rows.map((r) => `<li><span class="dot" style="background:${r.color}"></span>
+           <span class="when">${fmt(r.t)}</span><span>${r.text}</span></li>`).join("")}</ol>`
+      : `<p class="empty">No GC or wear-leveling activity in this interval.</p>`;
+  }
+
+  function renderTable() {
+    const rows = state.snapshots.map((s) => `
+      <tr><td>${fmt(s.t)}</td><td>${fmt(s.metrics.host_writes)}</td>
+      <td>${fmt(s.metrics.gc_writes)}</td><td>${fmt(s.metrics.wl_writes)}</td>
+      <td>${fmt(s.metrics.erases)}</td><td>${fmt2(s.metrics.waf)}</td>
+      <td>${fmt(s.metrics.erase_min)}–${fmt(s.metrics.erase_max)}</td></tr>`).join("");
+    $("table").innerHTML = `<table><thead><tr>
+      <th>Step</th><th>Host writes</th><th>GC writes</th><th>WL writes</th>
+      <th>Erases</th><th>WAF</th><th>Erase min–max</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }
+
+  function render() {
+    if (!state.snapshots.length) return;
+    const snap = state.snapshots[state.index];
+    $("readout").textContent =
+      `step ${state.index + 1}/${state.snapshots.length} · ${fmt(snap.t)} writes`;
+    $("scrub").value = String(state.index);
+    renderTiles();
+    renderLegend();
+    renderEvents();
+    drawGrid();
+    drawWaf();
+    drawHistogram();
+  }
+
+  // --- playback ------------------------------------------------------------
+
+  function stop() {
+    state.playing = false;
+    clearInterval(state.timer);
+    $("play").textContent = "Play";
+  }
+
+  function play() {
+    if (state.index >= state.snapshots.length - 1) state.index = 0;
+    state.playing = true;
+    $("play").textContent = "Pause";
+    clearInterval(state.timer);
+    state.timer = setInterval(() => {
+      if (state.index >= state.snapshots.length - 1) { stop(); render(); return; }
+      state.index++;
+      render();
+    }, Number($("speed").value));
+  }
+
+  function seek(index) {
+    state.index = Math.max(0, Math.min(state.snapshots.length - 1, index));
+    render();
+  }
+
+  function load(text, name) {
+    const parsed = parseTrace(text);
+    Object.assign(state, parsed, { index: 0 });
+    stop();
+
+    const c = state.config;
+    $("run-info").innerHTML =
+      `<code>${c.blocks}</code> blocks × <code>${c.pages_per_block}</code> pages · ` +
+      `gc <code>${c.gc_policy || "?"}</code> · wear leveling <code>${c.wear_leveling || "?"}</code> · ` +
+      `workload <code>${c.workload || "?"}</code> · ${fmt(c.logical_pages)} logical pages`;
+    $("file-label").textContent = name;
+    for (const id of ["play", "prev", "next", "scrub", "mode"]) $(id).disabled = false;
+    $("scrub").max = String(state.snapshots.length - 1);
+    renderTable();
+    render();
+  }
+
+  // --- wiring --------------------------------------------------------------
+
+  $("file").addEventListener("change", (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try { load(String(reader.result), file.name); }
+      catch (error) { alert("Could not read this trace: " + error.message); }
+    };
+    reader.readAsText(file);
+  });
+
+  $("play").addEventListener("click", () => (state.playing ? stop() : play()));
+  $("prev").addEventListener("click", () => { stop(); seek(state.index - 1); });
+  $("next").addEventListener("click", () => { stop(); seek(state.index + 1); });
+  $("scrub").addEventListener("input", (e) => { stop(); seek(Number(e.target.value)); });
+  $("mode").addEventListener("change", render);
+  $("speed").addEventListener("change", () => { if (state.playing) play(); });
+
+  document.addEventListener("keydown", (e) => {
+    if (!state.snapshots.length || e.target.tagName === "INPUT") return;
+    if (e.key === "ArrowRight") { stop(); seek(state.index + 1); }
+    else if (e.key === "ArrowLeft") { stop(); seek(state.index - 1); }
+    else if (e.key === " ") { e.preventDefault(); state.playing ? stop() : play(); }
+  });
+
+  // Per-block hover tooltip on the array.
+  const tip = $("tip");
+  $("grid").addEventListener("mousemove", (event) => {
+    const index = blockAt(event.clientX, event.clientY);
+    if (index !== state.hover) { state.hover = index; drawGrid(); }
+    if (index < 0) { tip.style.opacity = "0"; return; }
+
+    const block = state.snapshots[state.index].blocks[index];
+    let valid = 0, invalid = 0, free = 0;
+    for (const ch of block.p) {
+      if (ch === "v") valid++; else if (ch === "i") invalid++; else free++;
+    }
+    tip.innerHTML =
+      `<b>Block ${index}</b>` +
+      `<div class="r"><span>Valid</span><b>${valid}</b></div>` +
+      `<div class="r"><span>Invalid</span><b>${invalid}</b></div>` +
+      `<div class="r"><span>Free</span><b>${free}</b></div>` +
+      `<div class="r"><span>Erases</span><b>${block.e}</b></div>`;
+    tip.style.opacity = "1";
+    const x = Math.min(event.clientX + 14, window.innerWidth - 250);
+    const y = Math.min(event.clientY + 14, window.innerHeight - 120);
+    tip.style.left = x + "px";
+    tip.style.top = y + "px";
+  });
+  $("grid").addEventListener("mouseleave", () => {
+    tip.style.opacity = "0";
+    if (state.hover !== -1) { state.hover = -1; drawGrid(); }
+  });
+
+  let resizeTimer = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(render, 120);
+  });
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+
+  // Drag and drop anywhere on the page.
+  document.addEventListener("dragover", (e) => e.preventDefault());
+  document.addEventListener("drop", (e) => {
+    e.preventDefault();
+    const file = e.dataTransfer.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try { load(String(reader.result), file.name); }
+      catch (error) { alert("Could not read this trace: " + error.message); }
+    };
+    reader.readAsText(file);
+  });
+})();
+</script>
+</body>
+</html>
