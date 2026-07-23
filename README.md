@@ -228,6 +228,10 @@ ftlsim/
 └── .gitignore
 ```
 
+## preview 
+<img width="1280" height="730" alt="image" src="https://github.com/user-attachments/assets/22029d4e-f9ba-4045-9dc9-026264f511df" />
+
+
 ## Design Decisions
 
 - **Victim selection**: supports both greedy (most invalid pages) and cost-benefit (invalid-page count weighted against erase age) policies for direct comparison. Policies sit behind a common interface so new strategies slot in without touching GC internals.
